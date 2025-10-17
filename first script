@@ -1,0 +1,776 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from fpdf import FPDF
+import os, json, hashlib
+from datetime import datetime, timedelta
+from functools import lru_cache
+import logging
+import time
+
+# ------------------- CONFIG -------------------
+st.set_page_config(page_title="Polish Stock Market Filter", layout="wide")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+DATA_FOLDER = "user_data"
+if not os.path.exists(DATA_FOLDER):
+    os.makedirs(DATA_FOLDER)
+
+WSE_TICKERS = [
+    "PKN.WA", "PEO.WA", "PKO.WA", "KGH.WA", "PZU.WA", "LPP.WA", "CDR.WA",
+    "JSW.WA", "DNP.WA", "CCC.WA", "BZW.WA", "MBK.WA", "ING.WA", "ACP.WA",
+    "CPS.WA", "PGE.WA", "TPE.WA", "PKP.WA", "ALE.WA", "LTS.WA"
+]
+
+WEIGHT_DEFAULTS = {
+    "Compound Annual Growth Rate": 1.0,
+    "Recent Price Momentum": 0.8,
+    "Price Trend Strength": 0.5,
+    "Volatility/Risk": 0.5,
+    "Trading Volume": 0.3
+}
+
+METRIC_EXPLANATIONS = {
+    "Compound Annual Growth Rate": "Average annual return over the past 2 years.",
+    "Recent Price Momentum": "Stock price change over last 3 months.",
+    "Price Trend Strength": "Strength of recent trend (last 60 days).",
+    "Volatility/Risk": "Daily price fluctuation (risk).",
+    "Trading Volume": "Average daily traded shares."
+}
+
+
+# ---------------- User Management ----------------
+def hash_password(password):
+    """Hash password for security"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def load_users():
+    """Load all registered users"""
+    users_file = os.path.join(DATA_FOLDER, "users.json")
+    if os.path.exists(users_file):
+        try:
+            with open(users_file, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, Exception) as e:
+            logger.error(f"Error loading users: {e}")
+            return {}
+    return {}
+
+
+def save_users(users):
+    """Save users to file"""
+    users_file = os.path.join(DATA_FOLDER, "users.json")
+    try:
+        with open(users_file, "w") as f:
+            json.dump(users, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving users: {e}")
+
+
+def load_user_data(username):
+    """Load user's portfolio and settings"""
+    user_file = os.path.join(DATA_FOLDER, f"{username}_data.json")
+    if os.path.exists(user_file):
+        try:
+            with open(user_file, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, Exception) as e:
+            logger.error(f"Error loading user data for {username}: {e}")
+
+    # Default structure
+    return {"portfolio": {}, "weights": WEIGHT_DEFAULTS.copy(), "analysis_history": []}
+
+
+def save_user_data(username, data):
+    """Save user's portfolio and settings"""
+    user_file = os.path.join(DATA_FOLDER, f"{username}_data.json")
+    try:
+        with open(user_file, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving user data for {username}: {e}")
+
+
+def register_user(username, password):
+    """Register a new user"""
+    if not username or not password:
+        return False, "Username and password are required"
+
+    users = load_users()
+    if username in users:
+        return False, "Username already exists"
+
+    users[username] = hash_password(password)
+    save_users(users)
+
+    # Create default user data file
+    user_data = load_user_data(username)
+    save_user_data(username, user_data)
+
+    return True, "Registration successful"
+
+
+def login_user(username, password):
+    """Authenticate user"""
+    users = load_users()
+    if username not in users:
+        return False, "Username not found"
+    if users[username] != hash_password(password):
+        return False, "Incorrect password"
+    return True, "Login successful"
+
+
+def safe_rerun():
+    """Safely rerun the app"""
+    time.sleep(0.5)  # Small delay to ensure state is updated
+    st.experimental_rerun()
+
+
+# ------------------- STOCK DATA -------------------
+@lru_cache(maxsize=64)
+def fetch_market_cap(ticker):
+    """Fetch market cap for a ticker with caching"""
+    try:
+        ticker_obj = yf.Ticker(ticker)
+        market_cap = ticker_obj.fast_info.get("market_cap", 0)
+        return market_cap if market_cap else 0
+    except Exception as e:
+        logger.warning(f"Could not fetch market cap for {ticker}: {e}")
+        return 0
+
+
+def fetch_top_wse(n=20):
+    """Fetch top WSE stocks by market cap"""
+    valid_tickers = []
+    for ticker in WSE_TICKERS[:min(n, len(WSE_TICKERS))]:
+        cap = fetch_market_cap(ticker)
+        if cap > 0:  # Only include tickers with valid market cap
+            valid_tickers.append((ticker, cap))
+
+    if not valid_tickers:
+        return WSE_TICKERS[:n]  # Fallback to original list
+
+    df = pd.DataFrame(valid_tickers, columns=["Ticker", "Cap"]).sort_values("Cap", ascending=False)
+    return df.head(n)["Ticker"].tolist()
+
+
+def download_price_history(ticker, period="2y", interval="1d"):
+    """Download price history with error handling"""
+    try:
+        df = yf.Ticker(ticker).history(period=period, interval=interval)
+        if df.empty:
+            raise ValueError(f"No data for {ticker}")
+        return df
+    except Exception as e:
+        logger.error(f"Error downloading data for {ticker}: {e}")
+        raise
+
+
+def compute_metrics(df):
+    """Compute financial metrics from price data"""
+    if df.empty or len(df) < 2:
+        return None
+
+    prices = df["Close"].dropna()
+    if len(prices) < 2:
+        return None
+
+    returns = prices.pct_change().dropna()
+    days = max((prices.index[-1] - prices.index[0]).days, 1)
+    years = days / 365.25
+    total_return = prices.iloc[-1] / prices.iloc[0] - 1
+
+    # CAGR calculation with safety
+    cagr = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0
+
+    # Volatility calculation
+    vol = returns.std() * np.sqrt(252) if len(returns) > 0 else 0
+
+    # Momentum calculation (3 months ~63 trading days)
+    lookback = min(63, len(prices) - 1)
+    momentum = prices.iloc[-1] / prices.iloc[-lookback - 1] - 1 if lookback > 0 else 0
+
+    # Price trend strength (slope of last 60 days)
+    if len(prices) >= 60:
+        try:
+            x = np.arange(len(prices.tail(60)))
+            slope = np.polyfit(x, prices.tail(60).values, 1)[0]
+        except:
+            slope = 0
+    else:
+        slope = 0
+
+    # Volume
+    volume = df["Volume"].mean() if not df["Volume"].empty else 0
+
+    return {
+        "Compound Annual Growth Rate": cagr,
+        "Volatility/Risk": vol,
+        "Recent Price Momentum": momentum,
+        "Price Trend Strength": slope,
+        "Trading Volume": volume,
+        "Current Price": prices.iloc[-1],
+        "Total Return": total_return
+    }
+
+
+def score_company(metrics, weights):
+    """Calculate composite score for a company"""
+    if not metrics:
+        return 0
+
+    try:
+        score = (
+                weights["Compound Annual Growth Rate"] * metrics["Compound Annual Growth Rate"] * 100 +
+                weights["Recent Price Momentum"] * metrics["Recent Price Momentum"] * 100 +
+                weights["Price Trend Strength"] * (
+                            metrics["Price Trend Strength"] / max(1e-6, metrics["Current Price"])) * 1000 +
+                weights["Trading Volume"] * np.log1p(max(0, metrics["Trading Volume"])) -
+                weights["Volatility/Risk"] * metrics["Volatility/Risk"] * 100
+        )
+        return score
+    except Exception as e:
+        logger.error(f"Error calculating score: {e}")
+        return 0
+
+
+def generate_pdf(df, filename="ranked_stocks.pdf"):
+    """Generate PDF report"""
+    try:
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", "B", 16)
+        pdf.cell(0, 12, "Polish Stock Market Analysis", ln=True, align="C")
+        pdf.set_font("Arial", size=9)
+        pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True)
+        pdf.ln(4)
+        pdf.set_font("Arial", "B", 8)
+
+        col_widths = [12, 20, 20, 20, 20, 20]
+        headers = ["Rank", "Ticker", "Score", "CAGR %", "Vol %", "Momentum %"]
+
+        for w, h in zip(col_widths, headers):
+            pdf.cell(w, 8, h, border=1, align="C")
+        pdf.ln()
+
+        pdf.set_font("Arial", size=8)
+        for i, row in enumerate(df.itertuples()):
+            pdf.cell(col_widths[0], 8, str(i + 1), border=1, align="C")
+            pdf.cell(col_widths[1], 8, row.Ticker, border=1)
+            pdf.cell(col_widths[2], 8, f"{row.Score:.2f}", border=1, align="R")
+            pdf.cell(col_widths[3], 8, f"{getattr(row, 'Compound_Annual_Growth_Rate', 0) * 100:.2f}", border=1,
+                     align="R")
+            pdf.cell(col_widths[4], 8, f"{getattr(row, 'Volatility_Risk', 0) * 100:.2f}", border=1, align="R")
+            pdf.cell(col_widths[5], 8, f"{getattr(row, 'Recent_Price_Momentum', 0) * 100:.2f}", border=1, align="R")
+            pdf.ln()
+
+        pdf.output(filename)
+        return filename
+    except Exception as e:
+        logger.error(f"Error generating PDF: {e}")
+        return None
+
+
+def get_current_price(ticker):
+    """Get current stock price"""
+    try:
+        data = yf.Ticker(ticker).history(period="1d")
+        if not data.empty:
+            return data["Close"].iloc[-1]
+        return None
+    except Exception as e:
+        logger.warning(f"Could not fetch current price for {ticker}: {e}")
+        return None
+
+
+# ------------------- MAIN APP -------------------
+def main():
+    """Main application function"""
+
+    # Initialize session state
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+        st.session_state.username = None
+        st.session_state.tickers = []
+        st.session_state.df_ranked = None
+        st.session_state.portfolio_snapshot = {}
+
+    # Show login/register if not logged in
+    if not st.session_state.logged_in:
+        show_login_register()
+        return
+
+    # Main application for logged-in users
+    show_main_app()
+
+
+def show_login_register():
+    """Show login and registration interface"""
+    st.title("🔐 Stock Market Filter - Login/Register")
+
+    tab_login, tab_register = st.tabs(["Login", "Register"])
+
+    with tab_login:
+        st.subheader("Login to Your Account")
+        username = st.text_input("Username", key="login_username")
+        password = st.text_input("Password", type="password", key="login_password")
+
+        if st.button("Login", use_container_width=True):
+            if not username or not password:
+                st.error("❌ Please enter both username and password")
+            else:
+                success, message = login_user(username, password)
+                if success:
+                    st.session_state.logged_in = True
+                    st.session_state.username = username
+
+                    # Load user-specific portfolio and store in session_state
+                    user_data = load_user_data(username)
+                    st.session_state.portfolio_snapshot = user_data.get("portfolio", {})
+
+                    st.success("✅ Login successful!")
+                    safe_rerun()
+                else:
+                    st.error(f"❌ {message}")
+
+    with tab_register:
+        st.subheader("Create New Account")
+        new_username = st.text_input("Choose username", key="reg_username")
+        new_password = st.text_input("Choose password", type="password", key="reg_password")
+        confirm_password = st.text_input("Confirm password", type="password", key="reg_confirm")
+
+        if st.button("Register", use_container_width=True):
+            if not new_username or not new_password:
+                st.error("❌ Please enter username and password")
+            elif new_password != confirm_password:
+                st.error("❌ Passwords do not match")
+            elif len(new_password) < 6:
+                st.error("❌ Password must be at least 6 characters")
+            else:
+                success, message = register_user(new_username, new_password)
+                if success:
+                    st.success("✅ Account created! Please login.")
+                else:
+                    st.error(f"❌ {message}")
+
+
+def show_main_app():
+    """Show the main application for logged-in users"""
+    st.title(f"📈 Stock Filter - Logged in as {st.session_state.username}")
+
+    # Logout button
+    if st.sidebar.button("Logout"):
+        st.session_state.logged_in = False
+        st.session_state.username = None
+        st.session_state.tickers = []
+        st.session_state.df_ranked = None
+        st.session_state.portfolio_snapshot = {}
+        st.success("✅ Logged out successfully!")
+        safe_rerun()
+
+    # Load user data
+    user_data = load_user_data(st.session_state.username)
+
+    # Sidebar: stock selection & weights
+    st.sidebar.header("Settings")
+    stock_mode = st.sidebar.radio("Select stocks", ["Top WSE", "Custom symbols"])
+
+    if stock_mode == "Top WSE":
+        n = st.sidebar.slider("Number of stocks", 1, len(WSE_TICKERS), 10)
+        tickers = fetch_top_wse(n)
+    else:
+        custom_input = st.sidebar.text_area("Enter tickers (one per line)",
+                                            value="\n".join(WSE_TICKERS[:5]))
+        tickers = [t.strip().upper() for t in custom_input.split("\n") if t.strip()]
+
+    st.session_state.tickers = tickers
+
+    # Weights configuration
+    st.sidebar.subheader("Ranking Weights")
+    weights = {}
+    for k, d in WEIGHT_DEFAULTS.items():
+        weights[k] = st.sidebar.slider(
+            k, 0.0, 2.0,
+            value=user_data["weights"].get(k, d),
+            step=0.1,
+            help=METRIC_EXPLANATIONS.get(k, "")
+        )
+
+    # Save weights to user data
+    user_data["weights"] = weights
+    save_user_data(st.session_state.username, user_data)
+
+    # Main Tabs
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Ranking", "🔍 Stock Details", "💼 Portfolio", "📥 PDF Export"])
+
+    # Ranking Tab
+    with tab1:
+        show_ranking_tab(tickers, weights)
+
+    # Stock Details Tab
+    with tab2:
+        show_stock_details_tab()
+
+    # Portfolio Tab
+    with tab3:
+        show_portfolio_tab(user_data)
+
+    # PDF Export Tab
+    with tab4:
+        show_pdf_export_tab()
+
+
+def show_ranking_tab(tickers, weights):
+    """Show the ranking analysis tab"""
+    st.header("📊 Stock Ranking Analysis")
+
+    if st.button("Run Analysis", type="primary"):
+        if not tickers:
+            st.error("❌ No tickers selected")
+        else:
+            results = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            for i, ticker in enumerate(tickers):
+                status_text.text(f"Fetching {ticker} ({i + 1}/{len(tickers)})")
+                try:
+                    df = download_price_history(ticker)
+                    metrics = compute_metrics(df)
+                    if metrics:
+                        metrics["Ticker"] = ticker
+                        metrics["Score"] = score_company(metrics, weights)
+                        results.append(metrics)
+                    else:
+                        logger.warning(f"No metrics computed for {ticker}")
+                except Exception as e:
+                    logger.warning(f"{ticker} skipped: {e}")
+                    st.warning(f"Could not fetch data for {ticker}")
+
+                progress_bar.progress((i + 1) / len(tickers))
+
+            status_text.empty()
+            progress_bar.empty()
+
+            if results:
+                df_ranked = pd.DataFrame(results).sort_values("Score", ascending=False).reset_index(drop=True)
+                st.session_state.df_ranked = df_ranked
+
+                # Format the display dataframe
+                display_df = df_ranked.copy()
+                percentage_columns = ["Compound Annual Growth Rate", "Volatility/Risk", "Recent Price Momentum",
+                                      "Total Return"]
+                for col in percentage_columns:
+                    if col in display_df.columns:
+                        display_df[col] = (display_df[col] * 100).round(2).astype(str) + "%"
+
+                if "Current Price" in display_df.columns:
+                    display_df["Current Price"] = display_df["Current Price"].round(2)
+
+                if "Trading Volume" in display_df.columns:
+                    display_df["Trading Volume"] = (display_df["Trading Volume"] / 1e6).round(2).astype(str) + "M"
+
+                st.success(f"✅ Analysis complete ({len(results)} stocks analyzed)")
+                st.dataframe(display_df, use_container_width=True)
+            else:
+                st.error("❌ No data could be fetched for any tickers")
+
+
+def show_stock_details_tab():
+    """Show detailed stock analysis tab"""
+    st.header("🔍 Detailed Stock Analysis")
+
+    if "tickers" not in st.session_state or not st.session_state.tickers:
+        st.warning("⚠️ Please select tickers first in the sidebar")
+        return
+
+    selected_ticker = st.selectbox("Choose stock", st.session_state.tickers)
+    months = st.number_input("Months for ROI calculation", 1, 60, 6)
+
+    if st.button("Show Stock Details", type="primary"):
+        with st.spinner(f"Fetching data for {selected_ticker}..."):
+            try:
+                df = download_price_history(selected_ticker, period="5y")
+
+                if df.empty:
+                    st.error(f"❌ No data available for {selected_ticker}")
+                    return
+
+                # Price chart
+                st.subheader(f"Price Chart - {selected_ticker}")
+                st.line_chart(df["Close"])
+
+                # Current metrics
+                current_price = df["Close"].iloc[-1]
+
+                # ROI calculation
+                past_date = df.index[-1] - timedelta(days=months * 30)
+                past_df = df[df.index <= past_date]
+
+                if not past_df.empty:
+                    past_price = past_df["Close"].iloc[-1]
+                    roi = (current_price / past_price) - 1
+
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Current Price", f"{current_price:.2f} PLN")
+                    with col2:
+                        st.metric(f"Price {months} months ago", f"{past_price:.2f} PLN")
+                    with col3:
+                        st.metric("Return", f"{roi * 100:.2f}%",
+                                  delta=f"{roi * 100:.2f}%")
+
+                # Additional metrics
+                metrics = compute_metrics(df)
+                if metrics:
+                    st.subheader("Performance Metrics")
+                    metric_cols = st.columns(2)
+
+                    with metric_cols[0]:
+                        st.metric("CAGR", f"{metrics['Compound Annual Growth Rate'] * 100:.2f}%")
+                        st.metric("Volatility", f"{metrics['Volatility/Risk'] * 100:.2f}%")
+
+                    with metric_cols[1]:
+                        st.metric("Recent Momentum", f"{metrics['Recent Price Momentum'] * 100:.2f}%")
+                        st.metric("Trading Volume", f"{metrics['Trading Volume']:,.0f}")
+
+            except Exception as e:
+                st.error(f"❌ Error analyzing {selected_ticker}: {e}")
+
+
+def show_portfolio_tab(user_data):
+    """Show portfolio management tab"""
+    st.header("💼 Your Portfolio")
+    st.markdown("Manage your stock holdings and track your investments")
+
+    # Ensure portfolio snapshot is in session state
+    if "portfolio_snapshot" not in st.session_state:
+        st.session_state.portfolio_snapshot = user_data.get("portfolio", {})
+
+    col1, col2 = st.columns([2, 1])
+
+    # Add Shares Section
+    with col1:
+        st.subheader("Add/Update Stock")
+        col_ticker, col_shares, col_avg_price = st.columns(3)
+
+        with col_ticker:
+            new_ticker = st.text_input("Stock Symbol (e.g., PKO.WA)", key="add_portfolio_ticker").upper().strip()
+
+        with col_shares:
+            new_shares = st.number_input(
+                "Shares",
+                min_value=0.0,
+                value=1.0,
+                step=1.0,
+                format="%.2f",
+                key="add_portfolio_shares"
+            )
+
+        with col_avg_price:
+            new_avg_price = st.number_input(
+                "Price (PLN)",
+                min_value=0.0,
+                value=0.0,
+                step=100.0,
+                format="%.2f",
+                key="add_portfolio_price"
+            )
+
+        add_message = st.empty()
+
+        if st.button("➕ Add/Update Portfolio", use_container_width=True, type="primary"):
+            if not new_ticker:
+                add_message.error("❌ Please enter a stock symbol")
+            elif new_shares <= 0:
+                add_message.error("❌ Shares must be greater than 0")
+            elif new_avg_price <= 0:
+                add_message.error("❌ Average price must be greater than 0")
+            else:
+                try:
+                    # Validate ticker by trying to get current price
+                    test_price = get_current_price(new_ticker)
+                    if test_price is None:
+                        add_message.error("❌ Invalid stock symbol or no data available")
+                    else:
+                        # Update portfolio
+                        if new_ticker in st.session_state.portfolio_snapshot:
+                            # Update existing position
+                            old_data = st.session_state.portfolio_snapshot[new_ticker]
+                            old_shares = old_data["shares"]
+                            old_avg = old_data["avg_price"]
+
+                            total_cost = (old_shares * old_avg) + (new_shares * new_avg_price)
+                            total_shares = old_shares + new_shares
+                            new_avg = total_cost / total_shares
+
+                            st.session_state.portfolio_snapshot[new_ticker]["shares"] = total_shares
+                            st.session_state.portfolio_snapshot[new_ticker]["avg_price"] = new_avg
+
+                            add_message.success(
+                                f"✅ Updated {new_ticker}: {old_shares:.2f} + {new_shares:.2f} shares = {total_shares:.2f} total")
+                        else:
+                            # Add new position
+                            st.session_state.portfolio_snapshot[new_ticker] = {
+                                "shares": new_shares,
+                                "avg_price": new_avg_price,
+                                "date_added": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            }
+                            add_message.success(
+                                f"✅ Added {new_shares:.2f} shares of {new_ticker} at {new_avg_price:.2f} PLN")
+
+                        # Save to user data
+                        user_data["portfolio"] = st.session_state.portfolio_snapshot
+                        save_user_data(st.session_state.username, user_data)
+
+                except Exception as e:
+                    add_message.error(f"❌ Error: {e}")
+
+    # Remove Shares Section
+    with col2:
+        st.subheader("Remove Shares")
+        remove_message = st.empty()
+
+        if st.session_state.portfolio_snapshot:
+            remove_ticker = st.selectbox(
+                "Select stock to remove",
+                options=list(st.session_state.portfolio_snapshot.keys()),
+                key="remove_ticker_select"
+            )
+
+            if remove_ticker:
+                current_shares = st.session_state.portfolio_snapshot[remove_ticker]["shares"]
+                remove_shares = st.number_input(
+                    "Shares to Remove",
+                    min_value=0.0,
+                    max_value=current_shares,
+                    value=min(1.0, current_shares),
+                    step=1.0,
+                    format="%.2f",
+                    key="remove_shares_input"
+                )
+
+                if st.button("❌ Remove Shares", use_container_width=True):
+                    if remove_shares <= 0:
+                        remove_message.error("❌ Enter a valid number of shares to remove")
+                    else:
+                        st.session_state.portfolio_snapshot[remove_ticker]["shares"] -= remove_shares
+
+                        if st.session_state.portfolio_snapshot[remove_ticker]["shares"] <= 0:
+                            del st.session_state.portfolio_snapshot[remove_ticker]
+                            remove_message.success(f"✅ Removed all shares of {remove_ticker}")
+                        else:
+                            remove_message.success(f"✅ Removed {remove_shares:.2f} shares of {remove_ticker}")
+
+                        # Save to user data
+                        user_data["portfolio"] = st.session_state.portfolio_snapshot
+                        save_user_data(st.session_state.username, user_data)
+        else:
+            st.info("📌 Your portfolio is empty")
+
+    # Portfolio Summary
+    st.subheader("Portfolio Summary")
+
+    if st.session_state.portfolio_snapshot:
+        portfolio_data = []
+        total_invested = 0.0
+        total_current_value = 0.0
+
+        for ticker, data in st.session_state.portfolio_snapshot.items():
+            try:
+                current_price = get_current_price(ticker)
+                shares = data["shares"]
+                avg_price = data["avg_price"]
+                invested = shares * avg_price
+
+                if current_price:
+                    current_value = shares * current_price
+                    gain = current_value - invested
+                    gain_percent = (gain / invested * 100) if invested > 0 else 0
+                else:
+                    current_value = 0
+                    gain = -invested
+                    gain_percent = -100
+
+                portfolio_data.append({
+                    "Ticker": ticker,
+                    "Shares": shares,
+                    "Avg Price": avg_price,
+                    "Current Price": current_price,
+                    "Invested": invested,
+                    "Current Value": current_value,
+                    "Gain/Loss": gain,
+                    "Gain %": gain_percent
+                })
+
+                total_invested += invested
+                total_current_value += current_value
+
+            except Exception as e:
+                logger.warning(f"Error processing {ticker}: {e}")
+
+        if portfolio_data:
+            # Create display dataframe
+            display_df = pd.DataFrame(portfolio_data)
+            display_df["Shares"] = display_df["Shares"].round(2)
+            display_df["Avg Price"] = display_df["Avg Price"].round(2)
+            display_df["Current Price"] = display_df["Current Price"].round(2)
+            display_df["Invested"] = display_df["Invested"].round(2)
+            display_df["Current Value"] = display_df["Current Value"].round(2)
+            display_df["Gain/Loss"] = display_df["Gain/Loss"].round(2)
+            display_df["Gain %"] = display_df["Gain %"].round(2)
+
+            st.dataframe(display_df, use_container_width=True)
+
+            # Portfolio metrics
+            total_gain = total_current_value - total_invested
+            total_gain_percent = (total_gain / total_invested * 100) if total_invested > 0 else 0
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Invested", f"{total_invested:.2f} PLN")
+            with col2:
+                st.metric("Current Value", f"{total_current_value:.2f} PLN")
+            with col3:
+                st.metric("Total Gain/Loss", f"{total_gain:.2f} PLN",
+                          delta=f"{total_gain:.2f} PLN")
+            with col4:
+                st.metric("Total Return", f"{total_gain_percent:.2f}%",
+                          delta=f"{total_gain_percent:.2f}%")
+    else:
+        st.info("📌 Your portfolio is empty. Add stocks to track your investments!")
+
+
+def show_pdf_export_tab():
+    """Show PDF export tab"""
+    st.header("📥 Export Results")
+
+    if "df_ranked" not in st.session_state or st.session_state.df_ranked is None:
+        st.info("📋 Please run the analysis first in the 'Ranking' tab")
+        return
+
+    if st.button("📄 Generate PDF Report", type="primary"):
+        with st.spinner("Generating PDF..."):
+            filename = f"stock_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            pdf_path = generate_pdf(st.session_state.df_ranked, filename)
+
+            if pdf_path and os.path.exists(pdf_path):
+                with open(pdf_path, "rb") as f:
+                    st.download_button(
+                        "💾 Download PDF",
+                        f,
+                        file_name=filename,
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+                st.success("✅ PDF generated successfully!")
+            else:
+                st.error("❌ Error generating PDF")
+
+
+# Run the app
+if __name__ == "__main__":
+    main()
